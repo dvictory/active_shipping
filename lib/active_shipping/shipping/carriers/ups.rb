@@ -14,7 +14,10 @@ module ActiveMerchant
       
       RESOURCES = {
         :rates => 'ups.app/xml/Rate',
-        :track => 'ups.app/xml/Track'
+        :track => 'ups.app/xml/Track',
+        :ship_confirm=>'ups.app/xml/ShipConfirm',
+        :ship_void=>'ups.app/xml/Void',
+        :ship_accept=>'ups.app/xml/ShipAccept'
       }
       
       PICKUP_CODES = HashWithIndifferentAccess.new({
@@ -120,7 +123,32 @@ module ActiveMerchant
         response = commit(:track, save_request(access_request + tracking_request), (options[:test] || false))
         parse_tracking_response(response, options)
       end
-      
+
+
+      #Derek added to get shipping labels
+      def ship_confirm(origin,destination,packages,options={})
+        origin, destination = upsified_location(origin), upsified_location(destination)
+        access_request = build_access_request
+        ship_confirm_request = build_ship_confirm_request(origin,destination,packages,options)
+        response = commit(:ship_confirm, save_request(access_request + ship_confirm_request), (options[:test] || false))
+        parse_ship_confirm_response(response,options)
+      end
+
+      def ship_accept(digest,options={})
+        access_request = build_access_request
+        ship_accept_request = build_ship_accept_request(digest)
+        response = commit(:ship_accept, save_request(access_request + ship_accept_request), (options[:test] || false))
+        parse_ship_accept_response(response)
+      end
+
+      def ship_void(shipment_number,tracking_numbers,options={})
+        access_request = build_access_request
+        ship_void_request = build_ship_void_request(shipment_number,tracking_numbers)
+        response = commit(:ship_void, save_request("<?xml version=\"1.0\" ?>" + access_request+"<?xml version=\"1.0\" ?>"+ship_void_request), (options[:test] || false))
+        parse_ship_void_response(response)
+      end
+
+
       protected
       
       def upsified_location(location)
@@ -240,13 +268,158 @@ module ActiveMerchant
         end
         xml_request.to_s
       end
-      
+
+      #DV added
+      def build_ship_confirm_request(origin, destination, packages, options={})
+        packages = Array(packages)
+        xml_request = XmlNode.new('ShipmentConfirmRequest') do |root_node|
+          root_node << XmlNode.new('Request') do |request|
+            request << XmlNode.new('RequestAction', 'ShipConfirm')
+            request << XmlNode.new('RequestOption', 'nonvalidate')
+            # not implemented: 'Rate' RequestOption to specify a single service query
+            # request << XmlNode.new('RequestOption', ((options[:service].nil? or options[:service] == :all) ? 'Shop' : 'Rate'))
+          end
+
+          #Label spec
+          root_node << XmlNode.new('LabelSpecification') do |label_node|
+            label_node << XmlNode.new('LabelPrintMethod') do |label_method|
+              label_method << XmlNode.new('Code', "GIF")
+              label_method << XmlNode.new('Description', "gif")
+            end
+            label_node << XmlNode.new('HTTPUserAgent', "Mozilla/4.5")
+            label_node << XmlNode.new('LabelImageFormat') do |label_method|
+              label_method << XmlNode.new('Code', "GIF")
+              label_method << XmlNode.new('Description', "gif")
+            end
+            # not implemented: PickupType/PickupDetails element
+          end
+
+          #Shipment Section
+          root_node << XmlNode.new('Shipment') do |shipment|
+            # not implemented: Shipment/Description element
+            shipment << XmlNode.new('RateInformation') do |ri|
+              ri << XmlNode.new('NegotiatedRatesIndicator')
+            end
+            shipment << build_ups_location_node('Shipper', (options[:shipper] || origin), options)
+            shipment << build_ups_location_node('ShipTo', destination, options)
+            #if options[:shipper] and options[:shipper] != origin
+            shipment << build_ups_location_node('ShipFrom', origin, options)
+            #end
+
+            # not implemented:  * Shipment/ShipmentWeight element
+            #                   * Shipment/ReferenceNumber element
+            #                   * Shipment/Service element
+            #                   * Shipment/PickupDate element
+            #                   * Shipment/ScheduledDeliveryDate element
+            #                   * Shipment/ScheduledDeliveryTime element
+            #                   * Shipment/AlternateDeliveryTime element
+            #                   * Shipment/DocumentsOnly element
+
+            #DV Payment Element
+            shipment << XmlNode.new("PaymentInformation") do |payment_node|
+              payment_node << XmlNode.new('Prepaid') do |prepaid_node|
+                prepaid_node << XmlNode.new('BillShipper') do |bill_node|
+                  bill_node << XmlNode.new('AccountNumber',options[:origin_account])
+                end
+              end
+
+            end
+
+            #DV Service Element
+            shipment << XmlNode.new("Service") do |service_node|
+              service_node << XmlNode.new('Code', options[:shipping_method])
+              service_node << XmlNode.new('Description', DEFAULT_SERVICES[@options[:shipping_method]])
+            end
+
+            packages.each do |package|
+              imperial = ['US','LR','MM'].include?(origin.country_code(:alpha2))
+
+              shipment << XmlNode.new("Package") do |package_node|
+
+                # not implemented:  * Shipment/Package/PackagingType element
+                #                   * Shipment/Package/Description element
+
+                package_node << XmlNode.new("PackagingType") do |packaging_type|
+                  packaging_type << XmlNode.new("Code", '02')
+                  packaging_type << XmlNode.new("Description", 'User Description')
+                end
+                package_node << XmlNode.new("Description", 'Package Description')
+                package_node << XmlNode.new("Dimensions") do |dimensions|
+                  dimensions << XmlNode.new("UnitOfMeasurement") do |units|
+                    units << XmlNode.new("Code", imperial ? 'IN' : 'CM')
+                  end
+                  [:length,:width,:height].each do |axis|
+                    value = ((imperial ? package.inches(axis) : package.cm(axis)).to_f*1000).round/1000.0 # 3 decimals
+                    dimensions << XmlNode.new(axis.to_s.capitalize, [value,0.1].max)
+                  end
+                end
+
+                package_node << XmlNode.new("PackageWeight") do |package_weight|
+                  package_weight << XmlNode.new("UnitOfMeasurement") do |units|
+                    units << XmlNode.new("Code", imperial ? 'LBS' : 'KGS')
+                  end
+
+                  value = ((imperial ? package.lbs : package.kgs).to_f*1000).round/1000.0 # 3 decimals
+                  package_weight << XmlNode.new("Weight", [value,0.1].max)
+                end
+                unless package.value.blank?
+                  package_node << XmlNode.new("PackageServiceOptions") do |package_service|
+                    package_service << XmlNode.new("InsuredValue") do |iv|
+                      iv << XmlNode.new("CurrentCode",package.currency)
+                      iv << XmlNode.new("MonetaryValue",package.value)
+                    end
+                  end
+                end
+                package_node << XmlNode.new("AdditionalHandling","0")
+
+                # not implemented:  * Shipment/Package/LargePackageIndicator element
+                #                   * Shipment/Package/ReferenceNumber element
+                #                   * Shipment/Package/PackageServiceOptions element
+                #                   * Shipment/Package/AdditionalHandling element
+              end
+
+            end
+
+            #                   * Shipment/RateInformation element
+          end
+
+        end
+        xml_request.to_s
+      end
+
+      def build_ship_accept_request(digest,options={})
+        xml_request = XmlNode.new('ShipmentAcceptRequest') do |root_node|
+          root_node << XmlNode.new('Request') do |request|
+            request << XmlNode.new('RequestAction', 'ShipAccept')
+          end
+          root_node << XmlNode.new('ShipmentDigest',digest)
+        end
+        xml_request.to_s
+      end
+
+      def build_ship_void_request(shipment_number,tracking_numbers,options={})
+        xml_request = XmlNode.new('VoidShipmentRequest') do |root_node|
+          root_node << XmlNode.new('Request') do |request|
+            request << XmlNode.new('RequestAction', 'Void')
+          end
+          root_node << XmlNode.new('ExpandedVoidShipment') do |void_shipment_node|
+            void_shipment_node << XmlNode.new('ShipmentIdentificationNumber', shipment_number)
+            tracking_numbers.each do |tn|
+              void_shipment_node << XmlNode.new('TrackingNumber', tn)
+            end
+          end
+        end
+        xml_request.to_s
+      end
+
       def build_location_node(name,location,options={})
         # not implemented:  * Shipment/Shipper/Name element
         #                   * Shipment/(ShipTo|ShipFrom)/CompanyName element
         #                   * Shipment/(Shipper|ShipTo|ShipFrom)/AttentionName element
         #                   * Shipment/(Shipper|ShipTo|ShipFrom)/TaxIdentificationNumber element
         location_node = XmlNode.new(name) do |location_node|
+          location_node << XmlNode.new('Name', location.name) unless location.name.blank?
+          location_node << XmlNode.new('CompanyName', location.company_name) unless location.company_name.blank?
           location_node << XmlNode.new('PhoneNumber', location.phone.gsub(/[^\d]/,'')) unless location.phone.blank?
           location_node << XmlNode.new('FaxNumber', location.fax.gsub(/[^\d]/,'')) unless location.fax.blank?
           
@@ -256,6 +429,38 @@ module ActiveMerchant
             location_node << XmlNode.new('ShipperAssignedIdentificationNumber', destination_account)
           end
           
+          location_node << XmlNode.new('Address') do |address|
+            address << XmlNode.new("AddressLine1", location.address1) unless location.address1.blank?
+            address << XmlNode.new("AddressLine2", location.address2) unless location.address2.blank?
+            address << XmlNode.new("AddressLine3", location.address3) unless location.address3.blank?
+            address << XmlNode.new("City", location.city) unless location.city.blank?
+            address << XmlNode.new("StateProvinceCode", location.province) unless location.province.blank?
+              # StateProvinceCode required for negotiated rates but not otherwise, for some reason
+            address << XmlNode.new("PostalCode", location.postal_code) unless location.postal_code.blank?
+            address << XmlNode.new("CountryCode", location.country_code(:alpha2)) unless location.country_code(:alpha2).blank?
+            address << XmlNode.new("ResidentialAddressIndicator", true) unless location.commercial? # the default should be that UPS returns residential rates for destinations that it doesn't know about
+            # not implemented: Shipment/(Shipper|ShipTo|ShipFrom)/Address/ResidentialAddressIndicator element
+          end
+        end
+      end
+
+      def build_ups_location_node(name,location,options={})
+        # not implemented:  * Shipment/Shipper/Name element
+        #                   * Shipment/(ShipTo|ShipFrom)/CompanyName element
+        #                   * Shipment/(Shipper|ShipTo|ShipFrom)/AttentionName element
+        #                   * Shipment/(Shipper|ShipTo|ShipFrom)/TaxIdentificationNumber element
+        location_node = XmlNode.new(name) do |location_node|
+          location_node << XmlNode.new('Name', location.name) unless location.name.blank?
+          location_node << XmlNode.new('CompanyName', location.company_name) unless location.company_name.blank?
+          location_node << XmlNode.new('PhoneNumber', location.phone.gsub(/[^\d]/,'')) unless location.phone.blank?
+          location_node << XmlNode.new('FaxNumber', location.fax.gsub(/[^\d]/,'')) unless location.fax.blank?
+
+          if name == 'Shipper' and (origin_account = @options[:origin_account] || options[:origin_account])
+            location_node << XmlNode.new('ShipperNumber', origin_account)
+          elsif name == 'ShipTo' and (destination_account = @options[:destination_account] || options[:destination_account])
+            location_node << XmlNode.new('ShipperAssignedIdentificationNumber', destination_account)
+          end
+
           location_node << XmlNode.new('Address') do |address|
             address << XmlNode.new("AddressLine1", location.address1) unless location.address1.blank?
             address << XmlNode.new("AddressLine2", location.address2) unless location.address2.blank?
@@ -395,6 +600,56 @@ module ActiveMerchant
           :destination => destination,
           :tracking_number => tracking_number)
       end
+
+      #DV added
+      def parse_ship_confirm_response(response, options={})
+        xml = REXML::Document.new(response)
+        success = response_success?(xml)
+        message = response_message(xml)
+        ret = Hash.new
+        if success
+          ret[:digest] = xml.elements['//ShipmentConfirmResponse/ShipmentDigest'][0].to_s
+          ret[:shipment_charges]=xml.elements['//ShipmentConfirmResponse/ShipmentCharges/TotalCharges/MonetaryValue'][0].to_s
+          ret[:shipment_number]=xml.elements['//ShipmentConfirmResponse/ShipmentIdentificationNumber'][0].to_s
+          ret[:shipment_weight]=xml.elements['//ShipmentConfirmResponse/BillingWeight/Weight'][0].to_s
+          ret
+        else
+          message
+        end
+      end
+
+      def parse_ship_accept_response(response_to_parse)
+        xml = REXML::Document.new(response_to_parse)
+        success = response_success?(xml)
+        message = response_message(xml)
+        puts xml
+        if success
+          response = Hash.new
+          response[:shipment_number] = xml.elements["//ShipmentAcceptResponse/ShipmentResults/ShipmentIdentificationNumber"][0].to_s
+          response[:tracking_number] = xml.elements["//ShipmentAcceptResponse/ShipmentResults/PackageResults/TrackingNumber"][0].to_s
+          response[:encoded_image] = xml.elements["//ShipmentAcceptResponse/ShipmentResults/PackageResults/LabelImage/GraphicImage"][0].to_s
+
+          if !xml.elements["//ShipmentAcceptResponse/ShipmentResults/ControlLogReceipt/GraphicImage"].nil?
+            hvr = xml.elements["//ShipmentAcceptResponse/ShipmentResults/ControlLogReceipt/GraphicImage"][0].to_s
+            response[:high_value_report_encoded] = hvr
+          end
+
+          response
+        else
+          message
+        end
+
+
+      end
+
+      def parse_ship_void_response(response_to_parse)
+        xml = REXML::Document.new(response_to_parse)
+        success = response_success?(xml)
+        message = response_message(xml)
+
+        message
+
+      end
       
       def location_from_address_node(address)
         return nil unless address
@@ -430,6 +685,7 @@ module ActiveMerchant
       end
       
       def commit(action, request, test = false)
+        puts "Posting to #{"#{test ? TEST_URL : LIVE_URL}/#{RESOURCES[action]}"}"
         ssl_post("#{test ? TEST_URL : LIVE_URL}/#{RESOURCES[action]}", request)
       end
       
